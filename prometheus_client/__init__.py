@@ -3,9 +3,11 @@
 from __future__ import unicode_literals
 
 import copy
+import glob
 import re
 import resource
 import os
+import shelve
 import time
 import threading
 import types
@@ -100,22 +102,63 @@ class _MutexValue(object):
     '''A float protected by a mutex.'''
 
     def __init__(self, name, labelnames, labelvalues):
-      self._value = 0.0
-      self._lock = Lock()
+        self._value = 0.0
+        self._lock = Lock()
 
     def inc(self, amount):
-      with self._lock:
-          self._value += amount
+        with self._lock:
+            self._value += amount
 
     def set(self, value):
-      with self._lock:
-          self._value = value
+        with self._lock:
+            self._value = value
 
     def get(self):
-      with self._lock:
-          return self._value
+        with self._lock:
+            return self._value
 
-_ValueClass = _MutexValue
+
+def _MultiProcessValue():
+    pid = os.getpid()
+    filename = os.path.join(os.environ['prometheus_multiproc_dir'], '{0}.db'.format(pid))
+    samples = shelve.open(filename)
+
+    class _ShelveValue(object):
+        '''A float protected by a mutex backed by a per-process shelve.'''
+        def __init__(self, name, labelnames, labelvalues):
+            self._key = repr((name, labelnames, labelvalues))
+            self._value = samples.get(self._key, 0.0)
+            samples[self._key] = self._value
+            samples.sync()
+            self._lock = Lock()
+
+        def inc(self, amount):
+            with self._lock:
+                self._value += amount
+                samples[self._key] = self._value
+                samples.sync()
+
+        def set(self, value):
+            with self._lock:
+                self._value = value
+                samples[self._key] = self._value
+                samples.sync()
+
+        def get(self):
+            with self._lock:
+                return self._value
+
+    return _ShelveValue
+
+
+# Should we enable multi-process mode?
+# This needs to be chosen before the first metric is constructed,
+# and as that may be in some arbitrary library the user/admin has
+# no control over we use an enviroment variable.
+if 'prometheus_multiproc_dir' in os.environ:
+    _Value = _MultiProcessValue()
+else:
+    _Value = _MutexValue
 
 
 class _LabelWrapper(object):
@@ -219,7 +262,7 @@ class Counter(object):
     _reserved_labelnames = []
 
     def __init__(self, name, labelnames, labelvalues):
-        self._value = _ValueClass(name, labelnames, labelvalues)
+        self._value = _Value(name, labelnames, labelvalues)
 
     def inc(self, amount=1):
         '''Increment counter by the given amount.'''
@@ -265,7 +308,7 @@ class Gauge(object):
     _reserved_labelnames = []
 
     def __init__(self, name, labelnames, labelvalues):
-        self._value = _ValueClass(name, labelnames, labelvalues)
+        self._value = _Value(name, labelnames, labelvalues)
 
     def inc(self, amount=1):
         '''Increment gauge by the given amount.'''
@@ -331,8 +374,8 @@ class Summary(object):
     _reserved_labelnames = ['quantile']
 
     def __init__(self, name, labelnames, labelvalues):
-        self._count = _ValueClass(name + '_count', labelnames, labelvalues)
-        self._sum = _ValueClass(name + '_sum', labelnames, labelvalues)
+        self._count = _Value(name + '_count', labelnames, labelvalues)
+        self._sum = _Value(name + '_sum', labelnames, labelvalues)
 
     def observe(self, amount):
         '''Observe the given amount.'''
@@ -386,7 +429,7 @@ class Histogram(object):
     _reserved_labelnames = ['histogram']
 
     def __init__(self, name, labelnames, labelvalues, buckets=(.005, .01, .025, .05, .075, .1, .25, .5, .75, 1.0, 2.5, 5.0, 7.5, 10.0, _INF)):
-        self._sum = _ValueClass(name + '_sum', labelnames, labelvalues)
+        self._sum = _Value(name + '_sum', labelnames, labelvalues)
         buckets = [float(b) for b in buckets]
         if buckets != sorted(buckets):
             # This is probably an error on the part of the user,
@@ -400,7 +443,7 @@ class Histogram(object):
         self._buckets = []
         bucket_labelnames = labelnames + ('le',)
         for b in buckets:
-          self._buckets.append(_ValueClass(name + '_bucket', bucket_labelnames, labelvalues + (_floatToGoString(b),)))
+          self._buckets.append(_Value(name + '_bucket', bucket_labelnames, labelvalues + (_floatToGoString(b),)))
 
     def observe(self, amount):
         '''Observe the given amount.'''
@@ -586,6 +629,26 @@ class ProcessCollector(object):
 
 PROCESS_COLLECTOR = ProcessCollector()
 """Default ProcessCollector in default Registry REGISTRY."""
+
+class MultiProcessCollector(object):
+    """Collector for files for multi-process mode."""
+    def __init__(self, registry, path=os.environ.get('prometheus_multiproc_dir')):
+        self._path = path
+        if registry:
+          registry.register(self)
+
+    def collect(self):
+        samples = {}
+        for f in glob.glob(os.path.join(self._path, '*.db')):
+            for key, value in shelve.open(f).items():
+                samples.setdefault(key, 0.0)
+                samples[key] += value
+        metrics = {}
+        for key in samples:
+            name, labelnames, labelvalues = eval(key)
+            metrics.setdefault(name, Metric(name, name, 'untyped'))
+            metrics[name].add_sample(name, dict(zip(labelnames, labelvalues)), samples[key])
+        return metrics.values()
 
 
 if __name__ == '__main__':
